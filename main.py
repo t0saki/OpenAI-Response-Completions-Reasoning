@@ -7,21 +7,26 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from typing import Dict, Any, AsyncGenerator
 
 # --- Configuration ---
+# The URL of the backend Reasoning API.
+# It can be overridden by setting the BACKEND_API_URL environment variable.
 BACKEND_API_URL = os.getenv(
     "BACKEND_API_URL", "https://api.openai.com/v1/responses")
 
 app = FastAPI(
     title="OpenAI Reasoning API Adapter",
-    description="A proxy to convert OpenAI Chat Completion requests to the new Reasoning API format.",
-    version="1.0.5-robust-streaming"  # Version bump for the robust streaming fix
+    description="A proxy to convert OpenAI Chat Completion requests to a new Reasoning API format.",
+    version="1.0.6"
 )
-
-# ... (translate_to_responses_format and format_as_chat_completion_chunk remain the same) ...
 
 
 def translate_to_responses_format(chat_request: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Translates a standard OpenAI Chat Completion request body to the
+    backend's Reasoning API format.
+    """
     backend_payload = {}
     last_user_message = ""
+    # Find the last user message from the 'messages' array.
     if "messages" in chat_request and isinstance(chat_request["messages"], list):
         for message in reversed(chat_request["messages"]):
             if message.get("role") == "user" and isinstance(message.get("content"), str):
@@ -29,7 +34,10 @@ def translate_to_responses_format(chat_request: Dict[str, Any]) -> Dict[str, Any
                 break
     if not last_user_message:
         raise ValueError("No valid user message found in the request.")
+
     backend_payload["input"] = last_user_message
+
+    # Pass through common parameters from the original request.
     passthrough_params = [
         "model", "stream", "temperature", "top_p", "max_tokens",
         "user", "metadata"
@@ -37,16 +45,23 @@ def translate_to_responses_format(chat_request: Dict[str, Any]) -> Dict[str, Any
     for param in passthrough_params:
         if param in chat_request:
             backend_payload[param] = chat_request[param]
+
+    # Handle specific reasoning parameters.
     reasoning_params = {}
     if "reasoning_effort" in chat_request:
         reasoning_params["effort"] = chat_request["reasoning_effort"]
     reasoning_params["summary"] = chat_request.get("reasoning_summary", "auto")
     if reasoning_params:
         backend_payload["reasoning"] = reasoning_params
+
     return backend_payload
 
 
 def format_as_chat_completion_chunk(id: str, model: str, content: str, role: str = None) -> str:
+    """
+    Formats a piece of data into a server-sent event (SSE) string
+    that mimics the OpenAI Chat Completion streaming chunk format.
+    """
     chunk = {
         "id": id,
         "object": "chat.completion.chunk",
@@ -67,23 +82,26 @@ def format_as_chat_completion_chunk(id: str, model: str, content: str, role: str
     return f"data: {json.dumps(chunk)}\n\n"
 
 
-async def stream_generator(backend_response: httpx.Response):
+async def stream_generator(backend_response: httpx.Response) -> AsyncGenerator[str, None]:
+    """
+    Parses the streaming response from the backend Reasoning API and yields
+    OpenAI-compatible chat completion chunks.
+    """
     reasoning_accumulator = ""
     is_reasoning_sent = False
-    response_id = "unknown"
-    model_name = "unknown"
+    response_id = "unknown-stream-id"
+    model_name = "unknown-model"
     buffer = ""
     done = False
+
     try:
         async for chunk in backend_response.aiter_raw():
             buffer += chunk.decode("utf-8", errors="ignore")
             while '\n' in buffer:
                 line, buffer = buffer.split('\n', 1)
-                line = line.rstrip('\r')
+                line = line.strip()
 
-                if not line or line.startswith(":"):
-                    continue
-                if not line.startswith("data:"):
+                if not line or not line.startswith("data:"):
                     continue
 
                 data_str = line.split("data:", 1)[1].lstrip()
@@ -93,52 +111,59 @@ async def stream_generator(backend_response: httpx.Response):
 
                 try:
                     event_data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
+                    event_type = event_data.get("type")
 
-                event_type = event_data.get("type")
+                    if event_type == "response.created":
+                        response_id = event_data.get(
+                            "response", {}).get("id", response_id)
+                        model_name = event_data.get(
+                            "response", {}).get("model", model_name)
 
-                if event_type == "response.created":
-                    response_id = event_data.get(
-                        "response", {}).get("id", response_id)
-                    model_name = event_data.get(
-                        "response", {}).get("model", model_name)
+                    elif event_type == "response.reasoning_summary_text.delta":
+                        reasoning_accumulator += event_data.get("delta", "")
 
-                elif event_type == "response.reasoning_summary_text.delta":
-                    reasoning_accumulator += event_data.get("delta", "")
-
-                # --- FIX IS HERE ---
-                elif event_type in ("response.reasoning_summary_part.done", "response.reasoning_summary_text.done"):
-                    if not is_reasoning_sent and reasoning_accumulator.strip():
-                        thinking_block = f"<thinking>\n{reasoning_accumulator.strip()}\n</thinking>\n"
-                        yield format_as_chat_completion_chunk(response_id, model_name, thinking_block, role="assistant")
-                        is_reasoning_sent = True
-                # --- END OF FIX ---
-
-                elif event_type == "response.output_text.delta":
-                    delta_content = event_data.get("delta", "")
-                    if delta_content:
-                        # Only send role="assistant" on the very first chunk sent
-                        role = "assistant" if not is_reasoning_sent else None
-                        yield format_as_chat_completion_chunk(response_id, model_name, delta_content, role=role)
-                        if role:  # If we just sent the role, mark it as sent for all future chunks
+                    elif event_type in ("response.reasoning_summary_part.done", "response.reasoning_summary_text.done"):
+                        if not is_reasoning_sent and reasoning_accumulator.strip():
+                            thinking_block = f"<thinking>\n{reasoning_accumulator.strip()}\n</thinking>\n"
+                            yield format_as_chat_completion_chunk(response_id, model_name, thinking_block, role="assistant")
                             is_reasoning_sent = True
 
-                elif event_type in ("response.completed", "response.cancelled", "response.error"):
-                    done = True
-                    break
+                    elif event_type == "response.output_text.delta":
+                        delta_content = event_data.get("delta", "")
+                        if delta_content:
+                            # The 'assistant' role is only sent with the very first content chunk.
+                            role = "assistant" if not is_reasoning_sent else None
+                            yield format_as_chat_completion_chunk(response_id, model_name, delta_content, role=role)
+                            if role:
+                                is_reasoning_sent = True
+
+                    elif event_type in ("response.completed", "response.cancelled", "response.error"):
+                        done = True
+                        break
+
+                except json.JSONDecodeError:
+                    # Ignore lines that are not valid JSON.
+                    continue
 
             if done:
                 break
 
     except httpx.ReadError as e:
-        print(f"ReadError during raw stream processing, treating as EOF: {e}")
+        print(
+            f"An httpx.ReadError occurred: {e}. This may happen if the client disconnects.")
+    finally:
+        # Always send the final [DONE] signal to the client.
+        yield "data: [DONE]\n\n"
 
-    # Send the final DONE signal
-    yield "data: [DONE]\n\n"
 
 @app.post("/v1/chat/completions")
 async def chat_completions_proxy(request: Request):
+    """
+    The main proxy endpoint. It receives an OpenAI Chat Completion request,
+    transforms it, sends it to the backend, and then transforms the response back.
+    """
+    # Get the Authorization header from the incoming request.
+    # This header should contain the API key (e.g., "Bearer sk-...").
     auth_header = request.headers.get("Authorization")
     if not auth_header:
         raise HTTPException(
@@ -155,15 +180,14 @@ async def chat_completions_proxy(request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
     is_stream = backend_payload.get("stream", False)
-
-    # 提高 read 超时时间，SSE 常见
+    # Set a long timeout, especially for streaming responses.
     timeout_config = httpx.Timeout(300.0, read=None)
 
+    # --- Streaming Logic ---
     if is_stream:
-        # 不要用 async with，这样客户端会在返回后立刻被关闭
         client = httpx.AsyncClient(timeout=timeout_config)
         headers = {
-            "Authorization": auth_header,
+            "Authorization": auth_header,  # Forward the original auth header.
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
         }
@@ -171,61 +195,58 @@ async def chat_completions_proxy(request: Request):
             backend_req = client.build_request(
                 "POST", BACKEND_API_URL, json=backend_payload, headers=headers)
             response = await client.send(backend_req, stream=True)
-
-            if response.status_code != 200:
-                error_content = await response.aread()
-                await response.aclose()
-                await client.aclose()
-                raise HTTPException(status_code=response.status_code,
-                                    detail=f"Error from backend API: {error_content}")
+            # Raise an exception for 4xx/5xx responses.
+            response.raise_for_status()
 
         except httpx.RequestError as e:
             await client.aclose()
             raise HTTPException(
                 status_code=502, detail=f"Could not connect to backend API: {e}")
+        except httpx.HTTPStatusError as e:
+            error_content = await e.response.aread()
+            await e.response.aclose()
+            await client.aclose()
+            raise HTTPException(status_code=e.response.status_code,
+                                detail=f"Error from backend API: {error_content.decode()}")
 
         async def downstream():
+            """Ensures all resources are properly closed after streaming."""
             try:
                 async for chunk in stream_generator(response):
                     yield chunk
             finally:
-                # 确保资源在流结束后关闭
-                try:
-                    await response.aclose()
-                finally:
-                    await client.aclose()
+                await response.aclose()
+                await client.aclose()
 
         return StreamingResponse(
             downstream(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-            },
+            media_type="text/event-stream"
         )
 
-    # 非流式：维持原逻辑，用 async with 即可
+    # --- Non-Streaming Logic ---
     async with httpx.AsyncClient(timeout=timeout_config) as client:
         headers = {
-            "Authorization": auth_header,
+            "Authorization": auth_header,  # Forward the original auth header.
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
         try:
-            backend_req = client.build_request(
-                "POST", BACKEND_API_URL, json=backend_payload, headers=headers)
-            response = await client.send(backend_req)
-            if response.status_code != 200:
-                error_content = await response.aread()
-                raise HTTPException(status_code=response.status_code,
-                                    detail=f"Error from backend API: {error_content}")
+            response = await client.post(
+                BACKEND_API_URL, json=backend_payload, headers=headers)
+            response.raise_for_status()
         except httpx.RequestError as e:
             raise HTTPException(
                 status_code=502, detail=f"Could not connect to backend API: {e}")
+        except httpx.HTTPStatusError as e:
+            error_content = await e.response.aread()
+            raise HTTPException(status_code=e.response.status_code,
+                                detail=f"Error from backend API: {error_content.decode()}")
 
         backend_data = response.json()
         reasoning_summary = ""
         message_content = ""
+
+        # Parse the non-streaming response structure.
         for item in backend_data.get("output", []):
             if item.get("type") == "reasoning":
                 for summary_part in item.get("summary", []):
@@ -241,6 +262,7 @@ async def chat_completions_proxy(request: Request):
             final_content += f"<thinking>\n{reasoning_summary.strip()}\n</thinking>\n"
         final_content += message_content.strip()
 
+        # Assemble the final OpenAI-compatible response.
         final_response = {
             "id": backend_data.get("id"),
             "object": "chat.completion",
@@ -260,4 +282,5 @@ async def chat_completions_proxy(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
+    # To run this script, use the command: uvicorn main:app --reload
     uvicorn.run(app, host="0.0.0.0", port=8000)
