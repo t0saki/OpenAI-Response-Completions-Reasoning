@@ -48,6 +48,7 @@ jobs:
           type=sha
 
     - name: Build and push Docker image
+      id: build
       uses: docker/build-push-action@v5
       with:
         context: .
@@ -59,6 +60,7 @@ jobs:
 
     - name: Generate artifact attestation
       uses: actions/attest-build-provenance@v1
+      if: steps.meta.outputs.tags != ''
       with:
         subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         subject-digest: ${{ steps.build.outputs.digest }}
