@@ -1,6 +1,6 @@
 # OpenAI Reasoning API 适配器
 
-这是一个 FastAPI 代理服务，用于将标准的 OpenAI Chat Completion 请求转换为新的 Reasoning API 格式。
+这是一个 FastAPI 代理服务，用于将标准的 OpenAI Chat Completion 请求转换为新的 Reasoning API 格式，且保留推理摘要。。
 
 ## 功能特性
 
@@ -9,6 +9,8 @@
 - 🔐 转发认证头部到后端 API
 - 📡 自动处理响应格式转换
 - 🐳 支持 Docker 部署
+- ⚙️ 可配置的后端 API URL
+- 🧠 保留并展示推理过程和摘要
 
 ## 快速开始
 
