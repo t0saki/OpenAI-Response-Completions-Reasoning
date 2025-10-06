@@ -88,10 +88,7 @@ async def stream_generator(backend_response: httpx.Response) -> AsyncGenerator[s
     OpenAI-compatible chat completion chunks.
     """
     reasoning_accumulator = ""
-    # 新增: 用于存储已收到的完整输出文本
-    full_output_accumulator = ""
     is_reasoning_sent = False
-    is_first_content_chunk = True  # 新增: 用于判断是否是第一个内容块
     response_id = "unknown-stream-id"
     model_name = "unknown-model"
     buffer = ""
@@ -130,30 +127,22 @@ async def stream_generator(backend_response: httpx.Response) -> AsyncGenerator[s
                             thinking_block = f"<thinking>\n{reasoning_accumulator.strip()}\n</thinking>\n"
                             yield format_as_chat_completion_chunk(response_id, model_name, thinking_block, role="assistant")
                             is_reasoning_sent = True
-                            is_first_content_chunk = False  # "thinking"块发出后，下一个内容块就不是第一个了
 
                     elif event_type == "response.output_text.delta":
-                        # --- START: 这是核心修改部分 ---
-                        new_full_content = event_data.get("delta", "")
-                        # 计算真正的增量
-                        actual_delta = new_full_content[len(
-                            full_output_accumulator):]
-                        # 更新累加器
-                        full_output_accumulator = new_full_content
-
-                        if actual_delta:
-                            # 只有在第一个内容块时才发送 "assistant" 角色
-                            role = "assistant" if is_first_content_chunk else None
-                            yield format_as_chat_completion_chunk(response_id, model_name, actual_delta, role=role)
+                        delta_content = event_data.get("delta", "")
+                        if delta_content:
+                            # The 'assistant' role is only sent with the very first content chunk.
+                            role = "assistant" if not is_reasoning_sent else None
+                            yield format_as_chat_completion_chunk(response_id, model_name, delta_content, role=role)
                             if role:
-                                is_first_content_chunk = False  # 发送后就不是第一个了
-                        # --- END: 核心修改部分结束 ---
+                                is_reasoning_sent = True
 
                     elif event_type in ("response.completed", "response.cancelled", "response.error"):
                         done = True
                         break
 
                 except json.JSONDecodeError:
+                    # Ignore lines that are not valid JSON.
                     continue
 
             if done:
@@ -163,7 +152,9 @@ async def stream_generator(backend_response: httpx.Response) -> AsyncGenerator[s
         print(
             f"An httpx.ReadError occurred: {e}. This may happen if the client disconnects.")
     finally:
+        # Always send the final [DONE] signal to the client.
         yield "data: [DONE]\n\n"
+
 
 @app.post("/v1/chat/completions")
 async def chat_completions_proxy(request: Request):
