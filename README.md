@@ -33,6 +33,15 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 ### Docker 运行
 
+#### 从 GitHub Container Registry 拉取
+
+直接从 GHCR 运行预构建的镜像：
+```bash
+docker run -p 8000:8000 ghcr.io/t0saki/openai-response-completions-reasoning:main
+```
+
+#### 从源码构建
+
 1. 构建镜像：
 ```bash
 docker build -t openai-reasoning-proxy .
@@ -43,9 +52,9 @@ docker build -t openai-reasoning-proxy .
 docker run -p 8000:8000 openai-reasoning-proxy
 ```
 
-3. 使用环境变量自定义配置：
+#### 使用环境变量自定义配置：
 ```bash
-docker run -p 8000:8000 -e BACKEND_API_URL="https://your-api-endpoint.com/v1/responses" openai-reasoning-proxy
+docker run -p 8000:8000 -e BACKEND_API_URL="https://your-api-endpoint.com/v1/responses" ghcr.io/t0saki/openai-response-completions-reasoning:main
 ```
 
 ## API 使用
